@@ -11,6 +11,8 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use windows_sys::Win32::Foundation::POINT;
 
 pub(crate) const BV_WINDOW_MUST_CLOSE: u32 = WM_USER + 1;
+// MXM PATCH: the frame clock's message (see `FrameClock`).
+pub(crate) const BV_FRAME: u32 = WM_USER + 2;
 
 use super::drop_target::DropTarget;
 use super::*;
@@ -40,6 +42,73 @@ const WIN_FRAME_TIMER: NonZeroUsize = match NonZeroUsize::new(4242) {
     Some(x) => x,
     None => unreachable!(),
 };
+
+// MXM PATCH: a frame clock that a busy host cannot starve.
+//
+// `WM_TIMER` is the lowest-priority message Windows has: it is only synthesised when the thread's
+// queue holds nothing else, a pending `WM_PAINT` included. A plugin's window lives on the host's
+// GUI thread, so a host that always has its next frame queued (redrawing back to back while it
+// plays, say) starves the window of every frame, and with them of its mouse and keyboard input,
+// which egui only reads in a frame. A posted message is retrieved before input, `WM_PAINT` and
+// `WM_TIMER`, so a thread that posts one every frame interval is heard whatever the host does.
+// At most one is ever waiting (`pending`), so a stalled window gets no backlog.
+//
+// `WM_TIMER` stays as the fallback, and `MIN_FRAME_INTERVAL` keeps the two from drawing twice
+// per interval.
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
+const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+struct FrameClock {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrameClock {
+    fn start(hwnd: HWnd, pending: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A window handle is not `Send`; the thread only ever posts to it, which any thread may.
+        let raw = hwnd.as_raw() as usize;
+        let thread = std::thread::Builder::new()
+            .name("baseview frame clock".into())
+            .spawn({
+                let stop = std::sync::Arc::clone(&stop);
+                move || {
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(FRAME_INTERVAL);
+                        if stop.load(Ordering::Acquire) || pending.swap(true, Ordering::AcqRel) {
+                            continue;
+                        }
+                        // SAFETY: the window outlives this thread: dropping the clock, which the
+                        // window does as it is destroyed, stops and joins it first.
+                        let posted = unsafe {
+                            PostMessageW(
+                                raw as windows_sys::Win32::Foundation::HWND,
+                                BV_FRAME,
+                                0,
+                                0,
+                            )
+                        } != 0;
+                        if !posted {
+                            pending.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for FrameClock {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 pub struct WindowHandle {
     init: Cell<Option<WindowInitializer>>,
@@ -234,6 +303,11 @@ pub struct BaseviewWindow {
     _keyboard_hook: Cell<Option<hook::KeyboardHookHandle>>,
     _drop_target: Cell<Option<ComObject<DropTarget>>>,
 
+    // MXM PATCH: the frame clock, its one waiting message, and when the last frame was drawn.
+    _frame_clock: Cell<Option<FrameClock>>,
+    frame_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_frame: Cell<Option<std::time::Instant>>,
+
     #[cfg(feature = "opengl")]
     gl_config: Option<crate::gl::GlConfig>,
 }
@@ -260,8 +334,15 @@ impl BaseviewWindow {
                     Rc::clone(&shared_state),
                 ));
 
+                // MXM PATCH: the frame clock starts with the window.
+                let frame_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let frame_clock = FrameClock::start(hwnd, std::sync::Arc::clone(&frame_pending));
+
                 BaseviewWindow {
                     window_state,
+                    _frame_clock: Cell::new(frame_clock),
+                    frame_pending,
+                    last_frame: Cell::new(None),
                     initial_size: init.settings.size,
                     handler_builder: Cell::new(Some(init.builder)),
                     handler: OnceCell::new(),
@@ -328,6 +409,16 @@ impl BaseviewWindow {
         }
 
         Ok(())
+    }
+
+    // MXM PATCH: a frame from either clock, unless the other drew one just now.
+    fn handle_on_frame_paced(&self) {
+        let now = std::time::Instant::now();
+        if self.last_frame.get().is_some_and(|last| now.duration_since(last) < MIN_FRAME_INTERVAL) {
+            return;
+        }
+        self.last_frame.set(Some(now));
+        self.handle_on_frame();
     }
 
     pub(crate) fn handle_on_frame(&self) {
@@ -593,9 +684,16 @@ unsafe fn wnd_proc_inner(
         }
         WM_TIMER => {
             if wparam == WIN_FRAME_TIMER.get() {
-                window_bv.handle_on_frame()
+                // MXM PATCH: paced against the frame clock below.
+                window_bv.handle_on_frame_paced()
             }
 
+            Some(0)
+        }
+        // MXM PATCH: the frame clock's message; the next one may be posted from now on.
+        BV_FRAME => {
+            window_bv.frame_pending.store(false, std::sync::atomic::Ordering::Release);
+            window_bv.handle_on_frame_paced();
             Some(0)
         }
         WM_CLOSE => {
