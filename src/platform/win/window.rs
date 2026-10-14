@@ -55,8 +55,54 @@ const WIN_FRAME_TIMER: NonZeroUsize = match NonZeroUsize::new(4242) {
 //
 // `WM_TIMER` stays as the fallback, and `MIN_FRAME_INTERVAL` keeps the two from drawing twice
 // per interval.
+//
+// **The clock leaves the thread a gap after every frame** (`FRAME_GAP`), whatever the screen's
+// rate. The same priority that lets a posted frame past a busy host lets it past the window's own
+// input: any frame that takes longer than the interval found the next one already posted when it
+// ended, and the window drew back to back while the host, its own windows and the mouse waited. A
+// vsynced present takes one refresh, so every screen under about 66 Hz did it, and a slow GPU
+// does it at any rate (MXM Player froze on a 4K, 59 Hz screen, 2026-10-14). So a frame is posted
+// only once the interval has passed since the last one started and the gap since it ended, never
+// while one is drawn: a frame of up to the interval less the gap keeps the interval's pace, and a
+// longer one is followed by the gap, in which input, the host's drawing and `WM_TIMER` run.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
 const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const FRAME_GAP: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// When the window's last frame started and ended, in nanoseconds from `origin`: shared with its
+/// frame clock, which posts the next frame from them.
+struct FrameTimes {
+    origin: std::time::Instant,
+    started: std::sync::atomic::AtomicU64,
+    ended: std::sync::atomic::AtomicU64,
+}
+
+impl FrameTimes {
+    fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            started: std::sync::atomic::AtomicU64::new(0),
+            ended: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        self.origin.elapsed().as_nanos() as u64
+    }
+}
+
+/// How long until the clock may post a frame, at `now`, after a frame that `started` and `ended`
+/// (nanoseconds on one clock): a gap's wait while a frame is drawn (`started > ended`), else
+/// whatever is left of the interval since it started and of the gap since it ended.
+fn until_due(now: u64, started: u64, ended: u64) -> std::time::Duration {
+    use std::time::Duration;
+    if started > ended {
+        return FRAME_GAP;
+    }
+    let since_start = Duration::from_nanos(now.saturating_sub(started));
+    let since_end = Duration::from_nanos(now.saturating_sub(ended));
+    FRAME_INTERVAL.saturating_sub(since_start).max(FRAME_GAP.saturating_sub(since_end))
+}
 
 struct FrameClock {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -64,7 +110,10 @@ struct FrameClock {
 }
 
 impl FrameClock {
-    fn start(hwnd: HWnd, pending: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+    fn start(
+        hwnd: HWnd, pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        times: std::sync::Arc<FrameTimes>,
+    ) -> Option<Self> {
         use std::sync::atomic::Ordering;
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -75,9 +124,22 @@ impl FrameClock {
             .spawn({
                 let stop = std::sync::Arc::clone(&stop);
                 move || {
+                    let mut wait = FRAME_INTERVAL;
                     while !stop.load(Ordering::Acquire) {
-                        std::thread::sleep(FRAME_INTERVAL);
-                        if stop.load(Ordering::Acquire) || pending.swap(true, Ordering::AcqRel) {
+                        std::thread::sleep(wait);
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        wait = until_due(
+                            times.now(),
+                            times.started.load(Ordering::Acquire),
+                            times.ended.load(Ordering::Acquire),
+                        );
+                        if !wait.is_zero() {
+                            continue;
+                        }
+                        wait = FRAME_INTERVAL;
+                        if pending.swap(true, Ordering::AcqRel) {
                             continue;
                         }
                         // SAFETY: the window outlives this thread: dropping the clock, which the
@@ -306,6 +368,7 @@ pub struct BaseviewWindow {
     // MXM PATCH: the frame clock, its one waiting message, and when the last frame was drawn.
     _frame_clock: Cell<Option<FrameClock>>,
     frame_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    frame_times: std::sync::Arc<FrameTimes>,
     last_frame: Cell<Option<std::time::Instant>>,
 
     #[cfg(feature = "opengl")]
@@ -336,12 +399,18 @@ impl BaseviewWindow {
 
                 // MXM PATCH: the frame clock starts with the window.
                 let frame_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let frame_clock = FrameClock::start(hwnd, std::sync::Arc::clone(&frame_pending));
+                let frame_times = std::sync::Arc::new(FrameTimes::new());
+                let frame_clock = FrameClock::start(
+                    hwnd,
+                    std::sync::Arc::clone(&frame_pending),
+                    std::sync::Arc::clone(&frame_times),
+                );
 
                 BaseviewWindow {
                     window_state,
                     _frame_clock: Cell::new(frame_clock),
                     frame_pending,
+                    frame_times,
                     last_frame: Cell::new(None),
                     initial_size: init.settings.size,
                     handler_builder: Cell::new(Some(init.builder)),
@@ -418,7 +487,10 @@ impl BaseviewWindow {
             return;
         }
         self.last_frame.set(Some(now));
+        let times = &self.frame_times;
+        times.started.store(times.now(), std::sync::atomic::Ordering::Release);
         self.handle_on_frame();
+        times.ended.store(times.now(), std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn handle_on_frame(&self) {
@@ -914,4 +986,60 @@ impl WindowHandle {
 
 pub fn copy_to_clipboard(_data: &str) {
     unimplemented!()
+}
+
+// MXM PATCH: the frame clock's pacing, at the rates screens and GPUs give it.
+#[cfg(test)]
+mod frame_clock_tests {
+    use super::{until_due, FRAME_GAP, FRAME_INTERVAL};
+    use std::time::Duration;
+
+    const MS: u64 = 1_000_000;
+
+    /// After a frame of `frame_ns` drawn from 100 ms: the start-to-start period until the next is
+    /// due, and the gap the thread is left between them.
+    fn after_a_frame_of(frame_ns: u64) -> (Duration, Duration) {
+        let started = 100 * MS;
+        let ended = started + frame_ns;
+        let wait = until_due(ended, started, ended);
+        (Duration::from_nanos(frame_ns) + wait, wait)
+    }
+
+    /// Up to the interval less the gap, 10 ms, a frame keeps the interval's pace.
+    #[test]
+    fn a_fast_frame_keeps_the_intervals_pace() {
+        // A vsynced present at 240, 144 and 120 Hz.
+        for frame_ns in [4_166_667, 6_944_444, 8_333_333] {
+            let (period, gap) = after_a_frame_of(frame_ns);
+            assert_eq!(period, FRAME_INTERVAL, "{frame_ns} ns");
+            assert!(gap >= FRAME_GAP, "{frame_ns} ns leaves {gap:?}");
+        }
+    }
+
+    /// **The freeze**: at 60, 59.94, 50 and 30 Hz, or any slow frame, the next frame used to be
+    /// posted before this one ended. Now the thread always gets the gap.
+    #[test]
+    fn a_frame_slower_than_the_interval_leaves_the_thread_its_gap() {
+        for frame_ns in [16_666_667, 16_683_350, 20_000_000, 33_333_333, 250 * MS] {
+            let (_, gap) = after_a_frame_of(frame_ns);
+            assert_eq!(gap, FRAME_GAP, "{frame_ns} ns");
+        }
+    }
+
+    #[test]
+    fn nothing_is_posted_while_a_frame_is_drawn() {
+        // Started at 100 ms, the previous one ended at 90 ms: drawing now, however late it is.
+        for now in [101 * MS, 130 * MS, 10_000 * MS] {
+            assert!(!until_due(now, 100 * MS, 90 * MS).is_zero());
+        }
+    }
+
+    #[test]
+    fn once_due_it_is_posted_at_once() {
+        let started = 100 * MS;
+        let ended = started + 2 * MS;
+        assert!(until_due(started + 15 * MS, started, ended).is_zero());
+        // The first frame: nothing drawn yet, so due once the clock has slept its interval.
+        assert!(until_due(15 * MS, 0, 0).is_zero());
+    }
 }
