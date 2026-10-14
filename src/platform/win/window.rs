@@ -1000,9 +1000,9 @@ mod frame_clock_tests {
     /// due, and the gap the thread is left between them.
     fn after_a_frame_of(frame_ns: u64) -> (Duration, Duration) {
         let started = 100 * MS;
-        let ended = started + frame_ns;
+        let ended = started.saturating_add(frame_ns);
         let wait = until_due(ended, started, ended);
-        (Duration::from_nanos(frame_ns) + wait, wait)
+        (Duration::from_nanos(frame_ns).saturating_add(wait), wait)
     }
 
     /// Up to the interval less the gap, 10 ms, a frame keeps the interval's pace.
