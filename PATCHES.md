@@ -24,8 +24,15 @@ The patch:
 - adds a frame clock, one thread per window, that posts `BV_FRAME` (`WM_USER + 2`) every 15 ms.
   A posted message is retrieved before input, `WM_PAINT` and `WM_TIMER`, so it arrives whatever the
   host does; at most one is waiting at a time, so a stalled window builds no backlog;
-- draws a frame on `BV_FRAME`, and keeps `WM_TIMER`'s frames as the fallback, paced so the two
-  never draw twice within 10 ms;
+- draws a frame on `BV_FRAME`, and keeps `WM_TIMER`'s frames as the fallback;
+- **leaves the thread a gap after every frame**: on the window's own thread, for both messages, no
+  frame starts within 10 ms of the last one's start or 5 ms of its end, and the clock holds its one
+  message's claim until that frame has ended. A posted message is retrieved before input, so
+  without the gap any frame longer than the clock's 15 ms — every vsynced present on a screen under
+  about 66 Hz — found the next one already posted, and the window drew back to back while the
+  host, its other windows and the mouse waited (MXM Player froze on a 4K, 59 Hz screen,
+  2026-10-14). The clock's reading of the frame times only decides when it wakes: one it posts
+  early is refused, and costs a wake-up;
 - stops and joins the clock when the window is destroyed, before its handle can be reused.
 
 The timer itself stays where upstream sets it (its placement orders a parent and child window's
@@ -38,4 +45,5 @@ drawing, upstream's own `FIXME` says). macOS and X11 are untouched.
 3. If upstream now draws frames in a way a busy host cannot starve, point the egui-baseview fork
    back at crates.io and archive this repository.
 4. Otherwise reapply only the `MXM PATCH` hunks, build an editor, and check it in a host that
-   redraws back to back: MXM Player with `MXM_SERVICE_MS=16` must not draw white.
+   redraws back to back: MXM Player with `MXM_SERVICE_MS=16` must not draw white, and on a 60 Hz
+   screen its windows must still move and take clicks with the editor open.
