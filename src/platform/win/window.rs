@@ -64,7 +64,14 @@ const WIN_FRAME_TIMER: NonZeroUsize = match NonZeroUsize::new(4242) {
 // does it at any rate (MXM Player froze on a 4K, 59 Hz screen, 2026-10-14). So a frame is posted
 // only once the interval has passed since the last one started and the gap since it ended, never
 // while one is drawn: a frame of up to the interval less the gap keeps the interval's pace, and a
-// longer one is followed by the gap, in which input, the host's drawing and `WM_TIMER` run.
+// longer one is followed by the gap, in which input and the host's drawing run.
+//
+// **The gap is kept where frames are drawn**, on the window's own thread, for both messages
+// (`frame_due`): no frame starts within `MIN_FRAME_INTERVAL` of the last one's start or `FRAME_GAP`
+// of its end. The clock's reading of the times is only when to wake: it reads two atomics another
+// thread writes, so it can see a frame that has just begun as finished, and post early. A frame
+// posted early is refused and its claim let go, which costs a wake-up, never the gap. The claim
+// itself (`pending`) is held from the post until the frame it asked for has ended.
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(15);
 const MIN_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 const FRAME_GAP: std::time::Duration = std::time::Duration::from_millis(5);
@@ -91,8 +98,8 @@ impl FrameTimes {
     }
 }
 
-/// How long until the clock may post a frame, at `now`, after a frame that `started` and `ended`
-/// (nanoseconds on one clock): a gap's wait while a frame is drawn (`started > ended`), else
+/// How long the clock sleeps before it posts a frame, at `now`, after a frame that `started` and
+/// `ended` (nanoseconds on one clock): a gap's wait while a frame is drawn (`started > ended`), else
 /// whatever is left of the interval since it started and of the gap since it ended.
 fn until_due(now: u64, started: u64, ended: u64) -> std::time::Duration {
     use std::time::Duration;
@@ -102,6 +109,18 @@ fn until_due(now: u64, started: u64, ended: u64) -> std::time::Duration {
     let since_start = Duration::from_nanos(now.saturating_sub(started));
     let since_end = Duration::from_nanos(now.saturating_sub(ended));
     FRAME_INTERVAL.saturating_sub(since_start).max(FRAME_GAP.saturating_sub(since_end))
+}
+
+/// Whether a frame may start at `now`, after one that started at `last_start` and ended at
+/// `last_end`: on the window's own thread, for the clock's message and `WM_TIMER` alike.
+fn frame_due(
+    now: std::time::Instant, last_start: Option<std::time::Instant>,
+    last_end: Option<std::time::Instant>,
+) -> bool {
+    let since = |then: Option<std::time::Instant>, wait| {
+        then.is_none_or(|then| now.saturating_duration_since(then) >= wait)
+    };
+    since(last_start, MIN_FRAME_INTERVAL) && since(last_end, FRAME_GAP)
 }
 
 struct FrameClock {
@@ -370,6 +389,7 @@ pub struct BaseviewWindow {
     frame_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_times: std::sync::Arc<FrameTimes>,
     last_frame: Cell<Option<std::time::Instant>>,
+    last_frame_end: Cell<Option<std::time::Instant>>,
 
     #[cfg(feature = "opengl")]
     gl_config: Option<crate::gl::GlConfig>,
@@ -412,6 +432,7 @@ impl BaseviewWindow {
                     frame_pending,
                     frame_times,
                     last_frame: Cell::new(None),
+                    last_frame_end: Cell::new(None),
                     initial_size: init.settings.size,
                     handler_builder: Cell::new(Some(init.builder)),
                     handler: OnceCell::new(),
@@ -480,16 +501,18 @@ impl BaseviewWindow {
         Ok(())
     }
 
-    // MXM PATCH: a frame from either clock, unless the other drew one just now.
+    // MXM PATCH: a frame from either clock, when one is due (`frame_due`), decided here on the
+    // window's own thread; its start and end published for the clock.
     fn handle_on_frame_paced(&self) {
         let now = std::time::Instant::now();
-        if self.last_frame.get().is_some_and(|last| now.duration_since(last) < MIN_FRAME_INTERVAL) {
+        if !frame_due(now, self.last_frame.get(), self.last_frame_end.get()) {
             return;
         }
         self.last_frame.set(Some(now));
         let times = &self.frame_times;
         times.started.store(times.now(), std::sync::atomic::Ordering::Release);
         self.handle_on_frame();
+        self.last_frame_end.set(Some(std::time::Instant::now()));
         times.ended.store(times.now(), std::sync::atomic::Ordering::Release);
     }
 
@@ -762,10 +785,11 @@ unsafe fn wnd_proc_inner(
 
             Some(0)
         }
-        // MXM PATCH: the frame clock's message; the next one may be posted from now on.
+        // MXM PATCH: the frame clock's message. Its claim is let go once the frame has ended (or
+        // been refused), so the clock cannot post the next while this one is drawn.
         BV_FRAME => {
-            window_bv.frame_pending.store(false, std::sync::atomic::Ordering::Release);
             window_bv.handle_on_frame_paced();
+            window_bv.frame_pending.store(false, std::sync::atomic::Ordering::Release);
             Some(0)
         }
         WM_CLOSE => {
@@ -991,8 +1015,8 @@ pub fn copy_to_clipboard(_data: &str) {
 // MXM PATCH: the frame clock's pacing, at the rates screens and GPUs give it.
 #[cfg(test)]
 mod frame_clock_tests {
-    use super::{until_due, FRAME_GAP, FRAME_INTERVAL};
-    use std::time::Duration;
+    use super::{frame_due, until_due, FRAME_GAP, FRAME_INTERVAL, MIN_FRAME_INTERVAL};
+    use std::time::{Duration, Instant};
 
     const MS: u64 = 1_000_000;
 
@@ -1041,5 +1065,41 @@ mod frame_clock_tests {
         assert!(until_due(started + 15 * MS, started, ended).is_zero());
         // The first frame: nothing drawn yet, so due once the clock has slept its interval.
         assert!(until_due(15 * MS, 0, 0).is_zero());
+    }
+
+    /// **No frame starts inside the gap**, whichever message asks: a `WM_TIMER` due the moment a
+    /// slow clock frame ends waits the gap out, as a clock frame does.
+    #[test]
+    fn no_frame_starts_inside_the_gap_after_a_slow_one() {
+        let start = Instant::now();
+        let end = start + Duration::from_nanos(16_900_000);
+        for ms in [0, 1, 4] {
+            let now = end + Duration::from_millis(ms);
+            assert!(!frame_due(now, Some(start), Some(end)), "{ms} ms after the end");
+        }
+        assert!(frame_due(end + FRAME_GAP, Some(start), Some(end)));
+    }
+
+    /// A fast frame is held to `MIN_FRAME_INTERVAL` from its start, as before the gap existed.
+    #[test]
+    fn a_fast_frame_waits_out_the_minimum_interval() {
+        let start = Instant::now();
+        let end = start + Duration::from_millis(2);
+        assert!(!frame_due(start + Duration::from_millis(9), Some(start), Some(end)));
+        assert!(frame_due(start + MIN_FRAME_INTERVAL, Some(start), Some(end)));
+        assert!(frame_due(start, None, None), "the first frame");
+    }
+
+    /// **The race the clock cannot win**: it read the times of the frame before (a finished one,
+    /// due) while a newer one began and ended, and posted. The window refuses the frame it asked
+    /// for, because the newer one ended inside the gap.
+    #[test]
+    fn a_frame_posted_on_a_stale_reading_is_refused() {
+        let ms = |n: u64| n * 1_000_000;
+        assert!(until_due(ms(140), ms(100), ms(117)).is_zero(), "the stale reading: due");
+        let origin = Instant::now();
+        let at = |n: u64| origin + Duration::from_nanos(ms(n));
+        // The frame drawn meanwhile: 122 to 139 ms. The posted frame arrives at 140.
+        assert!(!frame_due(at(140), Some(at(122)), Some(at(139))));
     }
 }
