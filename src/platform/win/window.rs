@@ -385,7 +385,7 @@ pub struct BaseviewWindow {
     _drop_target: Cell<Option<ComObject<DropTarget>>>,
 
     // MXM PATCH: the frame clock, its one waiting message, and when the last frame was drawn.
-    _frame_clock: Cell<Option<FrameClock>>,
+    frame_clock: Cell<Option<FrameClock>>,
     frame_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     frame_times: std::sync::Arc<FrameTimes>,
     last_frame: Cell<Option<std::time::Instant>>,
@@ -428,7 +428,7 @@ impl BaseviewWindow {
 
                 BaseviewWindow {
                     window_state,
-                    _frame_clock: Cell::new(frame_clock),
+                    frame_clock: Cell::new(frame_clock),
                     frame_pending,
                     frame_times,
                     last_frame: Cell::new(None),
@@ -633,6 +633,12 @@ impl WindowImpl for BaseviewWindow {
 
     fn before_destroy(&self, window: HWnd) {
         let _ = window.revoke_drag_drop();
+        // MXM PATCH: the frame clock stops, its thread joined, while the handle is still this
+        // window's. `WM_DESTROY` comes before Windows frees it, but the window itself may drop only
+        // after, when `DestroyWindow` was called from inside one of its own messages
+        // (`BV_WINDOW_MUST_CLOSE`), and a clock still running then could post to a handle reused
+        // by another window. The join waits at most one of the clock's sleeps.
+        drop(self.frame_clock.take());
     }
 }
 

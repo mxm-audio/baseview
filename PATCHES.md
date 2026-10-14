@@ -33,7 +33,9 @@ The patch:
   host, its other windows and the mouse waited (MXM Player froze on a 4K, 59 Hz screen,
   2026-10-14). The clock's reading of the frame times only decides when it wakes: one it posts
   early is refused, and costs a wake-up;
-- stops and joins the clock when the window is destroyed, before its handle can be reused.
+- stops and joins the clock at `WM_DESTROY`, before Windows frees the handle, and not only when the
+  window drops, which a `DestroyWindow` called from inside one of the window's own messages puts
+  after it.
 
 The timer itself stays where upstream sets it (its placement orders a parent and child window's
 drawing, upstream's own `FIXME` says). macOS and X11 are untouched.
