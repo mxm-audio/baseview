@@ -13,6 +13,8 @@ use windows_sys::Win32::Foundation::POINT;
 pub(crate) const BV_WINDOW_MUST_CLOSE: u32 = WM_USER + 1;
 // MXM PATCH: the frame clock's message (see `FrameClock`).
 pub(crate) const BV_FRAME: u32 = WM_USER + 2;
+// MXM PATCH (*Transient for, and the keys given back*): `WindowContext::focus_owner`'s request.
+pub(crate) const BV_FOCUS_OWNER: u32 = WM_USER + 3;
 
 use super::drop_target::DropTarget;
 use super::*;
@@ -316,8 +318,13 @@ impl WindowHandle {
             }
         };
 
+        // MXM PATCH (*Transient for, and the keys given back*): a window opened floating is made
+        // transient for `new_parent` rather than reparented, which panicked here. CLAP's
+        // `gui.set_transient` reaches a floating editor's window this way only, through the editor
+        // handle's `set_parent`.
         if !self.state.parented.get() {
-            panic!("Called set_parent on a floating window")
+            hwnd.set_owner(&new_parent.handle);
+            return Ok(());
         }
 
         hwnd.set_parent(&new_parent.handle)?;
@@ -988,6 +995,12 @@ unsafe fn wnd_proc_inner(
         //        state
         BV_WINDOW_MUST_CLOSE => {
             let _ = window.destroy();
+            Some(0)
+        }
+        // MXM PATCH (*Transient for, and the keys given back*): carried out here, outside the
+        // handler's calls (see `WindowState::focus_owner`).
+        BV_FOCUS_OWNER => {
+            window.focus_owner();
             Some(0)
         }
         _ => None,

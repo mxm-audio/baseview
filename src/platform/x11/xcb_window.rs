@@ -119,6 +119,20 @@ impl XcbWindow {
         )
     }
 
+    /// MXM PATCH (*Transient for, and the keys given back*): `WM_TRANSIENT_FOR`, the window this
+    /// one, opened floating, belongs to.
+    pub fn set_transient_for(
+        &self, owner: NonZeroU32,
+    ) -> Result<VoidCookie<'_, XCBConnection>, ConnectionError> {
+        self.connection.conn.change_property32(
+            PropMode::REPLACE,
+            self.window_id.get(),
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[owner.get()],
+        )
+    }
+
     pub fn set_title(&self, title: &str) -> Result<VoidCookie<'_, XCBConnection>, ConnectionError> {
         self.connection.conn.change_property8(
             PropMode::REPLACE,

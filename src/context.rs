@@ -45,6 +45,20 @@ impl WindowContext {
         Ok(())
     }
 
+    /// Gives the keyboard back to the window this one belongs to: the one a floating window is
+    /// transient for (see [`Window::set_parent`](crate::Window::set_parent)) is made active, and
+    /// a window embedded in another gives that one the focus.
+    ///
+    /// Like [`request_close`](Self::request_close), this is a request, carried out after the
+    /// [`WindowHandler`](crate::WindowHandler) method it is called from returns: giving the keys
+    /// away at once would tell the handler it lost them while it is still busy.
+    ///
+    /// MXM PATCH (*Transient for, and the keys given back*, `PATCHES.md`).
+    pub fn focus_owner(&self) -> Result<(), Error> {
+        self.inner.focus_owner()?;
+        Ok(())
+    }
+
     /// Resizes this window to the given `size`.
     ///
     /// The given `size` can either be in [physical](dpi::PhysicalSize) or

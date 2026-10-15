@@ -325,6 +325,14 @@ impl EventLoop {
                 Ok(())
             }
             WindowThreadRequest::SetParent(new_parent) => {
+                // MXM PATCH (*Transient for, and the keys given back*): a window opened floating is
+                // made transient for `new_parent` rather than reparented. CLAP's
+                // `gui.set_transient` reaches a floating editor's window this way only, through the
+                // editor handle's `set_parent`.
+                if self.window.floating {
+                    self.window.xcb_window.set_transient_for(new_parent.window_id)?.check()?;
+                    return Ok(());
+                }
                 self.window.xcb_window.reparent(Some(new_parent.window_id))?;
 
                 Ok(())
@@ -332,6 +340,11 @@ impl EventLoop {
             WindowThreadRequest::Show => {
                 self.window.xcb_window.map_window()?.check()?;
                 self.window.visibility_state.window_mapped(self.window.xcb_window.id());
+                // MXM PATCH (*Transient for, and the keys given back*): a floating window takes
+                // the keys when shown, as an embedded one does when its host's window is active.
+                if self.window.floating {
+                    self.window.activate(self.window.xcb_window.id().get())?;
+                }
                 Ok(())
             }
             WindowThreadRequest::Hide => {

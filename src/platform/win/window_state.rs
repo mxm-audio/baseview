@@ -83,6 +83,18 @@ impl WindowState {
         Ok(())
     }
 
+    /// MXM PATCH (*Transient for, and the keys given back*): see [`HWnd::focus_owner`], posted
+    /// as `request_close` is. Carried out at once, inside a frame or an event, it would activate
+    /// the owner on this thread there and then, and this window would hear it lost the focus while
+    /// its handler is still busy: egui-baseview's state is borrowed, and the panic aborts the host.
+    pub fn focus_owner(&self) -> Result<(), super::PlatformError> {
+        // SAFETY: This type guarantees the HWND is safe to use.
+        unsafe {
+            PostMessageW(self.hwnd.as_raw(), crate::platform::win::window::BV_FOCUS_OWNER, 0, 0);
+        }
+        Ok(())
+    }
+
     pub fn resize(&self, size: Size) -> Result<(), super::PlatformError> {
         // `self.window_info` will be modified in response to the `WM_SIZE` event that
         // follows the `SetWindowPos()` call

@@ -65,6 +65,10 @@ pub(crate) struct WindowInner {
     pub(crate) visibility_state: AncestorVisibilityState,
 
     pub(crate) main_thread_shared: Arc<WindowThreadShared>,
+
+    /// MXM PATCH (*Transient for, and the keys given back*): opened with no parent and not waiting
+    /// for one, so `set_parent` makes it transient rather than reparenting it.
+    pub(crate) floating: bool,
 }
 
 impl WindowInner {
@@ -148,6 +152,7 @@ impl WindowInner {
             is_mapped: false.into(),
             present_notify_requested: false.into(),
             main_thread_shared: shared,
+            floating: !will_have_parent,
 
             visibility_state,
 
@@ -207,6 +212,54 @@ impl WindowInner {
             .set_input_focus(InputFocus::POINTER_ROOT, self.xcb_window.id(), CURRENT_TIME)?
             .check()?;
 
+        Ok(())
+    }
+
+    /// MXM PATCH (*Transient for, and the keys given back*): gives the keyboard back to the window
+    /// this one belongs to: the one a floating window is transient for is made active through the
+    /// window manager; embedded, the window it is in takes the focus.
+    pub fn focus_owner(&self) -> Result<()> {
+        let conn = &self.connection.conn;
+        let id = self.xcb_window.id().get();
+        let transient = conn
+            .get_property(
+                false,
+                id,
+                xproto::AtomEnum::WM_TRANSIENT_FOR,
+                xproto::AtomEnum::WINDOW,
+                0,
+                1,
+            )?
+            .reply()?;
+        let owner = transient.value32().and_then(|mut owners| owners.next()).filter(|&w| w != 0);
+        if let Some(owner) = owner {
+            return self.activate(owner);
+        }
+        let tree = conn.query_tree(id)?.reply()?;
+        if tree.parent != 0 && tree.parent != tree.root {
+            conn.set_input_focus(InputFocus::PARENT, tree.parent, CURRENT_TIME)?.check()?;
+        }
+        Ok(())
+    }
+
+    /// MXM PATCH (*Transient for, and the keys given back*): asks the window manager to make
+    /// `window` active (`_NET_ACTIVE_WINDOW`, from an application).
+    pub(crate) fn activate(&self, window: u32) -> Result<()> {
+        let event = xproto::ClientMessageEvent::new(
+            32,
+            window,
+            self.connection.atoms._NET_ACTIVE_WINDOW,
+            [1, CURRENT_TIME, 0, 0, 0],
+        );
+        self.connection
+            .conn
+            .send_event(
+                false,
+                self.connection.default_screen().root,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )?
+            .check()?;
         Ok(())
     }
 

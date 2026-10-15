@@ -18,8 +18,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetWindowLongPtrW, GetWindowLongW, SetParent, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, SWP_NOACTIVATE, SWP_NOMOVE,
+    DestroyWindow, GetAncestor, GetWindow, GetWindowLongPtrW, GetWindowLongW, SetForegroundWindow,
+    SetParent, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GA_PARENT, GA_ROOT,
+    GWLP_HWNDPARENT, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_LONG_PTR_INDEX,
 };
 
@@ -99,6 +100,38 @@ impl HWnd {
         }
 
         Ok(())
+    }
+
+    /// MXM PATCH (*Transient for, and the keys given back*): makes this window, opened floating,
+    /// owned by `owner`, which is what Windows has for transient: kept above it, minimised with it,
+    /// and the window [`HWnd::focus_owner`] gives the keys back to.
+    pub fn set_owner(&self, owner: &HWnd) {
+        // SAFETY: This type guarantees both HWNDs are safe to use. GWLP_HWNDPARENT on a top-level
+        // window sets its owner, not its parent.
+        unsafe { SetWindowLongPtrW(self.as_raw(), GWLP_HWNDPARENT, owner.as_raw() as isize) };
+    }
+
+    /// MXM PATCH (*Transient for, and the keys given back*): gives the keyboard back to the window
+    /// this one belongs to. The owner of the top-level window it is in comes to the foreground: a
+    /// floating window's owner, or the window owning the one a host embeds it in. With no owner,
+    /// the window it is embedded in takes the focus; a top-level window with neither has nowhere
+    /// to give it. The owner is read with `GW_OWNER`: `GA_ROOTOWNER` walks `GetParent`, which
+    /// gives a top-level window's owner only when it is a popup.
+    pub fn focus_owner(&self) {
+        // SAFETY: This type guarantees the HWND is safe to use; the others are the system's own,
+        // and a null one is never passed on.
+        unsafe {
+            let root = GetAncestor(self.as_raw(), GA_ROOT);
+            let owner = if root.is_null() { null_mut() } else { GetWindow(root, GW_OWNER) };
+            if !owner.is_null() {
+                SetForegroundWindow(owner);
+            } else if !root.is_null() && root != self.as_raw() {
+                let parent = GetAncestor(self.as_raw(), GA_PARENT);
+                if !parent.is_null() {
+                    SetFocus(parent);
+                }
+            }
+        }
     }
 
     pub fn get_dpi(&self, extended_user32: &ExtendedUser32) -> Option<Dpi> {

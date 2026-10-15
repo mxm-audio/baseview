@@ -38,7 +38,37 @@ The patch:
   after it.
 
 The timer itself stays where upstream sets it (its placement orders a parent and child window's
-drawing, upstream's own `FIXME` says). macOS and X11 are untouched.
+drawing, upstream's own `FIXME` says). macOS and X11 are untouched by this patch.
+
+## Transient for, and the keys given back (every platform)
+
+**Files:** `src/window.rs`, `src/context.rs`, `src/wrappers/win32/window/handle.rs`,
+`src/platform/win/{window,window_state}.rs`, `src/platform/macos/{context,view}.rs`,
+`src/platform/x11/{event_loop,window_shared,xcb_connection,xcb_window}.rs`; every hunk contains
+`MXM PATCH (*Transient for, and the keys given back*)`.
+
+An MXM editor's keyboard cursor leaves its window when VIEW goes past its edge, and the keys go
+back to the host's window (newDAWn's keyboard-reach plan, S11, 2026-10-15). The window that owns
+the editor's is the one the system knows: the owner of the top-level window an embedded editor is
+in, or the window a floating one is transient for. The patch:
+
+- adds `WindowContext::focus_owner()`, a request carried out after the handler's call, as
+  `request_close` is (Windows: a posted `BV_FOCUS_OWNER`; macOS: the main queue). Done at once,
+  inside a frame, it activated the owner on the same thread there and then; the editor heard it lost
+  the focus while egui-baseview's state was still borrowed, and the panic, in a window procedure,
+  aborted the host (newDAWn, tried 2026-10-15). Windows brings the owner (`GW_OWNER` of the root;
+  `GA_ROOTOWNER` misses an overlapped owned window) to the foreground, or focuses the parent of an
+  embedded window with no owner; macOS makes the parent window key, or the superview first
+  responder; X11 asks for `_NET_ACTIVE_WINDOW` on `WM_TRANSIENT_FOR`, or focuses the parent;
+- makes `Window::set_parent` on a window opened floating set it **transient for** that window
+  instead (Windows: its owner; macOS: a child window of the parent's; X11: `WM_TRANSIENT_FOR`),
+  where upstream panicked (Windows) or closed the window and embedded its view (macOS). CLAP's
+  `gui.set_transient` reaches a floating editor's window only through nice-plug's
+  `EditorHandle::set_parent` (the nice-plug fork's *Floating windows*), so this is its channel;
+- on X11, asks for a floating window to be active when it is shown.
+
+Windows is tried in newDAWn (an embedded MXM editor: VIEW out, OPEN back, VIEW out again);
+macOS and X11 type-check only, for the owner's batch.
 
 ## Refresh/drop procedure
 
@@ -49,3 +79,6 @@ drawing, upstream's own `FIXME` says). macOS and X11 are untouched.
 4. Otherwise reapply only the `MXM PATCH` hunks, build an editor, and check it in a host that
    redraws back to back: MXM Player with `MXM_SERVICE_MS=16` must not draw white, and on a 60 Hz
    screen its windows must still move and take clicks with the editor open.
+5. Whatever upstream has done about frames, reapply *Transient for, and the keys given back*
+   unless upstream has its own way to activate a window's owner and to make a floating window
+   transient, and try VIEW out of an MXM editor in newDAWn and back with OPEN.

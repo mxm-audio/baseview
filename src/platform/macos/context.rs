@@ -4,7 +4,7 @@ use crate::platform::Result;
 use crate::platform::{PlatformHandle, WindowSharedState};
 use crate::wrappers::appkit::{View, ViewRef};
 use crate::*;
-use dispatch2::MainThreadBound;
+use dispatch2::{DispatchQueue, MainThreadBound};
 use objc2::rc::{autoreleasepool, Weak};
 use objc2::runtime::NSObjectProtocol;
 use objc2::{MainThreadMarker, Message};
@@ -60,6 +60,32 @@ impl WindowContext {
             if let Some(window) = view.window() {
                 window.makeFirstResponder(Some(&view));
             }
+        });
+
+        Ok(())
+    }
+
+    /// MXM PATCH (*Transient for, and the keys given back*): gives the keyboard back to the window
+    /// this one belongs to: the window a floating one is a child of is made key; embedded, the view
+    /// it is in becomes the first responder. On the main queue, after the handler's call: done at
+    /// once, inside a frame or an event, this window would resign and its handler hear of it while
+    /// still busy, as on Windows.
+    pub fn focus_owner(&self) -> Result<()> {
+        let view = MainThreadBound::new(self.view.clone(), self.mtm);
+
+        DispatchQueue::main().exec_async(move || {
+            let Some(mtm) = MainThreadMarker::new() else { return };
+            let Some(view) = view.get(mtm).load() else { return };
+
+            autoreleasepool(|_| {
+                let Some(window) = view.window() else { return };
+                if let Some(parent) = window.parentWindow() {
+                    parent.makeKeyAndOrderFront(None);
+                // SAFETY: on the main thread; the superview comes back retained.
+                } else if let Some(superview) = unsafe { view.superview() } {
+                    window.makeFirstResponder(Some(&superview));
+                }
+            });
         });
 
         Ok(())

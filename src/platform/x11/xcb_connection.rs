@@ -26,6 +26,8 @@ x11rb::atom_manager! {
     pub Atoms: AtomsCookie {
         WM_PROTOCOLS,
         WM_DELETE_WINDOW,
+        // MXM PATCH (*Transient for, and the keys given back*)
+        _NET_ACTIVE_WINDOW,
 
         // Drag-N-Drop Atoms
         XdndAware,

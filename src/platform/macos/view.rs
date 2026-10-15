@@ -21,7 +21,7 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::{msg_send, AllocAnyThread, ClassType, MainThreadMarker};
 use objc2_app_kit::{
     NSApplication, NSDragOperation, NSDraggingInfo, NSEvent, NSFilenamesPboardType, NSTrackingArea,
-    NSTrackingAreaOptions, NSView, NSWindow,
+    NSTrackingAreaOptions, NSView, NSWindow, NSWindowOrderingMode,
 };
 use objc2_foundation::{NSArray, NSNotification, NSPoint, NSPointInRect, NSRect, NSSize, NSString};
 use std::cell::{Cell, RefCell};
@@ -206,6 +206,23 @@ impl BaseviewView {
     }
 
     pub fn set_parent(this: ViewRef<Self>, new_parent: Retained<NSView>) {
+        // MXM PATCH (*Transient for, and the keys given back*): a window opened floating is made a
+        // child window of the one `new_parent` is in, kept above it and moved with it, rather than
+        // closed and its view embedded. CLAP's `gui.set_transient` reaches a floating editor's
+        // window this way only, through the editor handle's `set_parent`.
+        if let ViewParentingType::Windowed { owned_window } = &*this.parenting.borrow() {
+            if let (Some(owned_window), Some(parent_window)) =
+                (owned_window.load(), new_parent.window())
+            {
+                // SAFETY: on the main thread, both windows retained here; AppKit drops the child
+                // when it closes, which `teardown` does, or when the parent closes.
+                unsafe {
+                    parent_window.addChildWindow_ordered(&owned_window, NSWindowOrderingMode::Above)
+                };
+            }
+            return;
+        }
+
         let previous_parenting = this.parenting.replace(ViewParentingType::Uninitialized);
         previous_parenting.teardown();
 

@@ -191,12 +191,14 @@ impl Window {
 
     /// Reparents this window using the given `parent`.
     ///
-    /// # Panics
+    /// A window created floating ([`WindowSettings`] with its [`parent`](WindowSettings::parent)
+    /// set to [`None`] and [`wait_for_parent`](WindowSettings::wait_for_parent) false) is not
+    /// reparented: it is made transient for `parent` (Windows: owned by it; macOS: a child window
+    /// of the window it is in; X11: `WM_TRANSIENT_FOR`), the window
+    /// [`WindowContext::focus_owner`](crate::WindowContext::focus_owner) gives the keys back to.
+    /// Upstream panics there, on Windows.
     ///
-    /// This function can panic if the window did not have a parent, but was already created as a floating window.
-    ///
-    /// This happens when the given [`WindowSettings`] had its [`parent`](WindowSettings::parent) set to [`None`] and
-    /// [`wait_for_parent`](WindowSettings::wait_for_parent) set to false.
+    /// MXM PATCH (*Transient for, and the keys given back*, `PATCHES.md`).
     #[inline]
     pub fn set_parent(&self, parent: impl Into<ParentWindowHandle>) -> Result<(), Error> {
         self.inner.set_parent(parent.into().inner)?;
