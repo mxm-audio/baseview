@@ -819,8 +819,12 @@ unsafe fn wnd_proc_inner(
                 lparam,
             );
 
-            if let Some(event) = opt_event {
-                window_bv.handle_event(Event::Keyboard(event));
+            let status = opt_event.map(|event| window_bv.handle_event(Event::Keyboard(event)));
+            // MXM PATCH (*Keys the editor ignores go to the host*)
+            let given =
+                window_state.keys_given_back.borrow_mut().decide(msg, wparam, lparam, status);
+            if !given.is_empty() {
+                give_keys_to_parent(window.as_raw(), &given);
             }
 
             if msg != WM_SYSKEYDOWN {
@@ -1032,6 +1036,24 @@ pub fn copy_to_clipboard(_data: &str) {
 }
 
 // MXM PATCH: the frame clock's pacing, at the rates screens and GPUs give it.
+/// MXM PATCH (*Keys the editor ignores go to the host*): posts `messages` to the window `hwnd` is
+/// embedded in. A top-level window, floating, has no parent to give them to.
+fn give_keys_to_parent(
+    hwnd: windows_sys::Win32::Foundation::HWND, messages: &[(u32, WPARAM, LPARAM)],
+) {
+    // SAFETY: plain Win32 calls on a window handle this thread's window procedure was given; a
+    // handle gone stale since makes them fail, nothing more.
+    unsafe {
+        let parent = GetAncestor(hwnd, GA_PARENT);
+        if parent.is_null() || parent == GetDesktopWindow() {
+            return;
+        }
+        for &(msg, wparam, lparam) in messages {
+            PostMessageW(parent, msg, wparam, lparam);
+        }
+    }
+}
+
 #[cfg(test)]
 mod frame_clock_tests {
     use super::{frame_due, until_due, FRAME_GAP, FRAME_INTERVAL, MIN_FRAME_INTERVAL};

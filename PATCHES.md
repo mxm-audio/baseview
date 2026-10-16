@@ -70,6 +70,32 @@ in, or the window a floating one is transient for. The patch:
 Windows is tried in newDAWn (an embedded MXM editor: VIEW out, OPEN back, VIEW out again);
 macOS and X11 type-check only, for the owner's batch.
 
+## Keys the editor ignores go to the host (Windows)
+
+**Files:** `src/platform/win/{window,window_state}.rs`; every hunk contains
+`MXM PATCH (*Keys the editor ignores go to the host*)`.
+
+Upstream's Windows window answers every key message it is sent as handled, whatever the window's
+handler says of the key, so a key an embedded editor doesn't use goes nowhere. baseview's macOS view
+already gives an ignored key to the next responder; JUCE's windows post an unhandled one to their
+parent (`forwardMessageToParent`). Ableton Live 11.3.25 hands a plugin window every key while it has
+the focus (measured 2026-10-16) and acts on those that come back: with ValhallaDelay's JUCE window
+focused, T played and Space started the transport; with an MXM editor's, neither did. The patch:
+
+- posts `WM_KEYDOWN`, `WM_CHAR` and `WM_KEYUP` the handler answers `EventStatus::Ignored` to the
+  window's parent (`GetAncestor(GA_PARENT)`), for a window embedded in another only; a top-level
+  window, floating, keeps upstream's behaviour;
+- holds back a key-down whose character follows, and gives it with that character or not at all,
+  since the character is where the handler's answer comes;
+- sends a key-up the way its key-down went, whatever the handler says of it, so the host never sees
+  half a key;
+- leaves `WM_SYS*` keys to Windows' default handling, which already takes them to the top level.
+
+What a window answers is its handler's business: egui-baseview's fork asks the app
+(*Keys the app uses, asked*). Tried in Ableton Live 11.3.26 (VST3) and Bitwig 5 (CLAP), 2026-10-16:
+T and Space go to the host, the editor's keys and arrows stay. `KeysGivenBack`'s tests hold the
+decision.
+
 ## Refresh/drop procedure
 
 1. Extract a new published baseview over this folder, retaining this file.
@@ -82,3 +108,5 @@ macOS and X11 type-check only, for the owner's batch.
 5. Whatever upstream has done about frames, reapply *Transient for, and the keys given back*
    unless upstream has its own way to activate a window's owner and to make a floating window
    transient, and try VIEW out of an MXM editor in newDAWn and back with OPEN.
+6. Reapply *Keys the editor ignores go to the host* unless upstream's Windows window gives an
+   ignored key to its parent, and try T and Space in an MXM editor in Ableton Live.
