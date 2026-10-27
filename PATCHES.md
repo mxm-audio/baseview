@@ -35,7 +35,13 @@ The patch:
   early is refused, and costs a wake-up;
 - stops and joins the clock at `WM_DESTROY`, before Windows frees the handle, and not only when the
   window drops, which a `DestroyWindow` called from inside one of the window's own messages puts
-  after it.
+  after it;
+- **draws no frame while the window is off screen** (`on_screen`): it or an ancestor hidden, or its
+  top-level window minimised. A host may hide a plugin's window rather than close it. DaVinci
+  Resolve 21.1 hides the dialog an editor is embedded in, so every MXM editor opened there drew on
+  its GUI thread after it was closed; with six alive, that thread spent about 60 % of its time in
+  OpenGL presents and Resolve's UI froze for seconds at a time (sampled 2026-10-27). The clock
+  still posts, and a skipped message costs a visibility check.
 
 The timer itself stays where upstream sets it (its placement orders a parent and child window's
 drawing, upstream's own `FIXME` says). macOS and X11 are untouched by this patch.
@@ -104,7 +110,8 @@ decision.
    back at crates.io and archive this repository.
 4. Otherwise reapply only the `MXM PATCH` hunks, build an editor, and check it in a host that
    redraws back to back: MXM Player with `MXM_SERVICE_MS=16` must not draw white, and on a 60 Hz
-   screen its windows must still move and take clicks with the editor open.
+   screen its windows must still move and take clicks with the editor open. In DaVinci Resolve,
+   an editor opened and closed several times on one track must leave its UI as quick as without.
 5. Whatever upstream has done about frames, reapply *Transient for, and the keys given back*
    unless upstream has its own way to activate a window's owner and to make a floating window
    transient, and try VIEW out of an MXM editor in newDAWn and back with OPEN.

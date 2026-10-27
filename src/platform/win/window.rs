@@ -509,8 +509,12 @@ impl BaseviewWindow {
     }
 
     // MXM PATCH: a frame from either clock, when one is due (`frame_due`), decided here on the
-    // window's own thread; its start and end published for the clock.
+    // window's own thread; its start and end published for the clock. None while the window is
+    // off screen (`on_screen`).
     fn handle_on_frame_paced(&self) {
+        if !on_screen(self.window_state.hwnd.as_raw()) {
+            return;
+        }
         let now = std::time::Instant::now();
         if !frame_due(now, self.last_frame.get(), self.last_frame_end.get()) {
             return;
@@ -1033,6 +1037,16 @@ impl WindowHandle {
 
 pub fn copy_to_clipboard(_data: &str) {
     unimplemented!()
+}
+
+/// MXM PATCH: whether `hwnd` can be seen: it and every ancestor visible, and its top-level window
+/// not minimised. A host may hide a plugin's window rather than close it: DaVinci Resolve 21.1
+/// hides the dialog an editor is embedded in, and six hidden MXM editors drawing there held its
+/// GUI thread in OpenGL presents until its own UI froze for seconds (2026-10-27).
+fn on_screen(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    // SAFETY: plain Win32 queries on a window handle this thread's window procedure was given; a
+    // handle gone stale since makes them answer false, nothing more.
+    unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(GetAncestor(hwnd, GA_ROOT)) == 0 }
 }
 
 // MXM PATCH: the frame clock's pacing, at the rates screens and GPUs give it.
