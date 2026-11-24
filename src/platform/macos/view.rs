@@ -71,6 +71,10 @@ pub(crate) struct BaseviewView {
     keyboard_state: KeyboardState,
 
     parenting: RefCell<ViewParentingType>,
+    /// MXM PATCH (*Transient for, and the keys given back*): opened floating, as against waiting
+    /// in a hidden window of its own for the parent `set_parent` brings (`wait_for_parent`: macOS
+    /// has no view without a window, so it waits in one, as upstream does).
+    floating: bool,
     pub(crate) lifetime_tied_to_app: Cell<Option<Weak<NSApplication>>>,
 
     host: Host,
@@ -94,6 +98,10 @@ impl BaseviewView {
             SizingStrategy::from_settings(&init.settings),
         ));
 
+        // MXM PATCH (*Transient for, and the keys given back*): see `floating`.
+        let floating = matches!(parenting, ViewParentingType::Windowed { .. })
+            && !init.settings.wait_for_parent;
+
         let inner = BaseviewView {
             mtm,
             state: Rc::clone(&state),
@@ -103,6 +111,7 @@ impl BaseviewView {
             window_handler: WindowHandlerContainer::new(),
             notification_center_observer: None.into(),
             parenting: ViewParentingType::Uninitialized.into(),
+            floating,
             host: init.host,
             lifetime_tied_to_app: None.into(),
             cursor_manager: CursorManager::new(),
@@ -209,16 +218,21 @@ impl BaseviewView {
         // MXM PATCH (*Transient for, and the keys given back*): a window opened floating is made a
         // child window of the one `new_parent` is in, kept above it and moved with it, rather than
         // closed and its view embedded. CLAP's `gui.set_transient` reaches a floating editor's
-        // window this way only, through the editor handle's `set_parent`.
-        if let ViewParentingType::Windowed { owned_window } = &*this.parenting.borrow() {
-            if let (Some(owned_window), Some(parent_window)) =
-                (owned_window.load(), new_parent.window())
-            {
-                // SAFETY: on the main thread, both windows retained here; AppKit drops the child
-                // when it closes, which `teardown` does, or when the parent closes.
-                unsafe {
-                    parent_window.addChildWindow_ordered(&owned_window, NSWindowOrderingMode::Above)
-                };
+        // window this way only, through the editor handle's `set_parent`. A window waiting for
+        // its parent (a CLAP editor embedded, created before `gui.set_parent`) is closed and its
+        // view embedded, as upstream does.
+        if this.floating {
+            if let ViewParentingType::Windowed { owned_window } = &*this.parenting.borrow() {
+                if let (Some(owned_window), Some(parent_window)) =
+                    (owned_window.load(), new_parent.window())
+                {
+                    // SAFETY: on the main thread, both windows retained here; AppKit drops the
+                    // child when it closes, which `teardown` does, or when the parent closes.
+                    unsafe {
+                        parent_window
+                            .addChildWindow_ordered(&owned_window, NSWindowOrderingMode::Above)
+                    };
+                }
             }
             return;
         }
@@ -363,7 +377,16 @@ impl ViewImpl for BaseviewView {
                 return;
             }
 
-            if notify_host {
+            // MXM PATCH (*The host is told a size only by an embedded view*, macOS): a view in a
+            // window of its own has no parent area for the host to resize. Waiting for its parent,
+            // it changes scale as it goes into that window, inside the host's CLAP `gui.create`,
+            // and a request then reached a host with no GUI open (Bitwig 5 logs the plugin as
+            // misbehaving); the host reads the size with `gui.get_size` before `gui.set_parent`.
+            let embedded = matches!(
+                this.parenting.try_borrow().as_deref(),
+                Ok(ViewParentingType::Parented { .. })
+            );
+            if notify_host && embedded {
                 if let Err(e) = this.host.request_resize(new_size) {
                     warn!("Host failed to resize parent view: {}", e);
 

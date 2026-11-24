@@ -70,11 +70,17 @@ in, or the window a floating one is transient for. The patch:
   instead (Windows: its owner; macOS: a child window of the parent's; X11: `WM_TRANSIENT_FOR`),
   where upstream panicked (Windows) or closed the window and embedded its view (macOS). CLAP's
   `gui.set_transient` reaches a floating editor's window only through nice-plug's
-  `EditorHandle::set_parent` (the nice-plug fork's *Floating windows*), so this is its channel;
+  `EditorHandle::set_parent` (the nice-plug fork's *Floating windows*), so this is its channel.
+  **On macOS a window waiting for its parent is not floating**: macOS has no view without a
+  window, so a window opened with `wait_for_parent` (a CLAP editor embedded, created in
+  `gui.create` before `gui.set_parent`) waits in a hidden window of its own, and `set_parent`
+  embeds its view as upstream does (`BaseviewView::floating`). Made a child window, every CLAP
+  editor opened beside Bitwig 5's window for it, that window left empty (2026-11-24);
 - on X11, asks for a floating window to be active when it is shown.
 
 Windows is tried in newDAWn (an embedded MXM editor: VIEW out, OPEN back, VIEW out again);
-macOS and X11 type-check only, for the owner's batch.
+macOS: a CLAP editor embedded in Bitwig 5, opened, closed and opened again (mxm-fx-pitch,
+2026-11-24); X11 type-checks only, for the owner's batch.
 
 ## Keys the editor ignores go to the host (Windows)
 
@@ -102,6 +108,20 @@ What a window answers is its handler's business: egui-baseview's fork asks the a
 T and Space go to the host, the editor's keys and arrows stay. `KeysGivenBack`'s tests hold the
 decision.
 
+## The host is told a size only by an embedded view (macOS)
+
+**File:** `src/platform/macos/view.rs`; its hunk contains
+`MXM PATCH (*The host is told a size only by an embedded view*, macOS)`.
+
+Upstream's macOS view asks the host to resize whenever its size or scale changes, whatever its
+parent. A view waiting for its parent changes scale as it goes into its own hidden window, inside
+the host's CLAP `gui.create`, so the request reached a host with no GUI open: Bitwig 5 logged every
+MXM CLAP editor as misbehaving ("Plugin called clap_host_gui->request_resize() but do not have an
+opened gui", 2026-11-24). The patch asks only for a view embedded in the host's
+(`ViewParentingType::Parented`): a view in a window of its own has no parent area for the host to
+resize, and the host reads a waiting editor's size with `gui.get_size` before `gui.set_parent`.
+Tried with the embedding above: Bitwig 5 logs nothing.
+
 ## Refresh/drop procedure
 
 1. Extract a new published baseview over this folder, retaining this file.
@@ -117,3 +137,6 @@ decision.
    transient, and try VIEW out of an MXM editor in newDAWn and back with OPEN.
 6. Reapply *Keys the editor ignores go to the host* unless upstream's Windows window gives an
    ignored key to its parent, and try T and Space in an MXM editor in Ableton Live.
+7. Reapply *The host is told a size only by an embedded view* unless upstream's macOS view no
+   longer asks the host from a window of its own, and open an MXM CLAP editor in Bitwig on macOS:
+   it must open inside Bitwig's window, with nothing in Bitwig's engine log.
